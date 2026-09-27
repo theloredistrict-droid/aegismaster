@@ -1,0 +1,211 @@
+// Sample implementation skeleton. Rename/export macros to match your module setup.
+
+#include "CombatStateMachine.h"
+
+UCombatStateMachine::UCombatStateMachine()
+{
+    PrimaryComponentTick.bCanEverTick = true;
+}
+
+void UCombatStateMachine::BeginPlay()
+{
+    Super::BeginPlay();
+    StateEnteredAt = GetWorld()->GetTimeSeconds();
+}
+
+void UCombatStateMachine::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+    ++SimulationFrame;
+    const double Now = GetWorld()->GetTimeSeconds();
+    UpdateStateTimers(Now);
+    ConsumeBufferedInput();
+
+    for (int32 i = InputBuffer.Num() - 1; i >= 0; --i)
+    {
+        if ((Now - InputBuffer[i].Timestamp) > InputBufferSeconds)
+        {
+            InputBuffer.RemoveAtSwap(i);
+        }
+    }
+}
+
+bool UCombatStateMachine::CanTransition(ECombatState From, ECombatState To) const
+{
+    if (From == ECombatState::Dead)
+    {
+        return To == ECombatState::Dead;
+    }
+
+    switch (From)
+    {
+        case ECombatState::Neutral:
+        case ECombatState::Locomotion:
+            return true;
+
+        case ECombatState::AttackStartup:
+            return To == ECombatState::AttackActive || To == ECombatState::Dodge || To == ECombatState::HitReact;
+
+        case ECombatState::AttackActive:
+            return To == ECombatState::AttackRecovery || To == ECombatState::HitReact || To == ECombatState::Riposte;
+
+        case ECombatState::AttackRecovery:
+            return To == ECombatState::Neutral || To == ECombatState::Locomotion || To == ECombatState::Guard;
+
+        case ECombatState::Guard:
+            return To == ECombatState::Parry || To == ECombatState::Neutral || To == ECombatState::HitReact || To == ECombatState::GuardBreak;
+
+        case ECombatState::Parry:
+            return To == ECombatState::Guard || To == ECombatState::Riposte || To == ECombatState::HitReact;
+
+        case ECombatState::HitReact:
+            return To == ECombatState::Neutral || To == ECombatState::Stagger || To == ECombatState::Knockdown;
+
+        case ECombatState::Stagger:
+            return To == ECombatState::Neutral || To == ECombatState::GuardBreak || To == ECombatState::Knockdown;
+
+        case ECombatState::GuardBreak:
+            return To == ECombatState::Stagger || To == ECombatState::Knockdown;
+
+        case ECombatState::Dodge:
+            return To == ECombatState::Neutral || To == ECombatState::Locomotion || To == ECombatState::AttackStartup;
+
+        case ECombatState::Riposte:
+            return To == ECombatState::AttackStartup || To == ECombatState::AttackActive || To == ECombatState::AttackRecovery;
+
+        case ECombatState::Knockdown:
+            return To == ECombatState::Neutral || To == ECombatState::Dead;
+
+        default:
+            return false;
+    }
+}
+
+bool UCombatStateMachine::TryEnterState(ECombatState RequestedState)
+{
+    if (RequestedState == CurrentState || !CanTransition(CurrentState, RequestedState))
+    {
+        return RequestedState == CurrentState;
+    }
+
+    const ECombatState Previous = CurrentState;
+    CurrentState = RequestedState;
+    StateEnteredAt = GetWorld()->GetTimeSeconds();
+    OnCombatStateChanged.Broadcast(Previous, CurrentState);
+    return true;
+}
+
+void UCombatStateMachine::BufferAttack(EStrikeDirection Direction, bool bHeavy)
+{
+    FCombatInputCommand Command;
+    Command.Direction = Direction;
+    Command.Timestamp = GetWorld()->GetTimeSeconds();
+    Command.bHeavy = bHeavy ? 1 : 0;
+
+    // Keep a short queue; combat should never feel like an input backlog.
+    if (InputBuffer.Num() >= 2)
+    {
+        InputBuffer.RemoveAt(0);
+    }
+
+    InputBuffer.Add(Command);
+}
+
+void UCombatStateMachine::BeginGuard()
+{
+    TryEnterState(ECombatState::Guard);
+}
+
+void UCombatStateMachine::EndGuard()
+{
+    if (CurrentState == ECombatState::Guard || CurrentState == ECombatState::Parry)
+    {
+        TryEnterState(ECombatState::Neutral);
+    }
+}
+
+void UCombatStateMachine::BeginParryWindow()
+{
+    bParryWindowOpen = true;
+    ParryWindowOpenedAt = GetWorld()->GetTimeSeconds();
+    TryEnterState(ECombatState::Parry);
+}
+
+void UCombatStateMachine::EndParryWindow()
+{
+    bParryWindowOpen = false;
+    ParryWindowOpenedAt = -1.0;
+    if (CurrentState == ECombatState::Parry)
+    {
+        TryEnterState(ECombatState::Guard);
+    }
+}
+
+void UCombatStateMachine::BeginAttackActiveWindow()
+{
+    bAttackWindowOpen = true;
+    AttackWindowOpenedAt = GetWorld()->GetTimeSeconds();
+    TryEnterState(ECombatState::AttackActive);
+}
+
+void UCombatStateMachine::EndAttackActiveWindow()
+{
+    bAttackWindowOpen = false;
+    AttackWindowOpenedAt = -1.0;
+    if (CurrentState == ECombatState::AttackActive)
+    {
+        TryEnterState(ECombatState::AttackRecovery);
+    }
+}
+
+ECombatResolution UCombatStateMachine::ResolveIncomingHit(const FCombatHitContext& IncomingHit, double ContactTimestamp)
+{
+    ECombatResolution Resolution = ECombatResolution::Hit;
+
+    if (CurrentState == ECombatState::Parry && bParryWindowOpen)
+    {
+        const double Delta = FMath::Abs(ContactTimestamp - ParryWindowOpenedAt);
+        if (Delta <= PerfectParryWindowSeconds)
+        {
+            Resolution = ECombatResolution::PerfectParry;
+            TryEnterState(ECombatState::Riposte);
+        }
+    }
+    else if (CurrentState == ECombatState::Guard)
+    {
+        Resolution = ECombatResolution::Guarded;
+    }
+    else
+    {
+        TryEnterState(ECombatState::HitReact);
+    }
+
+    FCombatHitContext Result = IncomingHit;
+    Result.Resolution = Resolution;
+    OnCombatResolution.Broadcast(Result);
+    return Resolution;
+}
+
+void UCombatStateMachine::ConsumeBufferedInput()
+{
+    if (InputBuffer.Num() == 0)
+    {
+        return;
+    }
+
+    if (CurrentState == ECombatState::Neutral || CurrentState == ECombatState::Locomotion || CurrentState == ECombatState::AttackRecovery)
+    {
+        const FCombatInputCommand Command = InputBuffer[0];
+        InputBuffer.RemoveAt(0);
+
+        // Resolve this direction into an animation montage in the animation/combat driver.
+        TryEnterState(ECombatState::AttackStartup);
+    }
+}
+
+void UCombatStateMachine::UpdateStateTimers(double NowSeconds)
+{
+    // State-specific timeout logic belongs here or in per-state data assets.
+    // Keep it deterministic and driven by timestamps rather than wall-clock callbacks.
+}

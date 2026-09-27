@@ -1,0 +1,121 @@
+#include "VRPhysicsWeaponComponent.h"
+#include "VRWeaponBindingComponent.h"
+#include "GameFramework/Actor.h"
+#include "PhysicsEngine/BodyInstance.h"
+
+UVRPhysicsWeaponComponent::UVRPhysicsWeaponComponent()
+{
+    PrimaryComponentTick.bCanEverTick = false;
+}
+
+void UVRPhysicsWeaponComponent::BeginPlay()
+{
+    Super::BeginPlay();
+
+    WeaponBody = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
+    if (WeaponBody)
+    {
+        WeaponBody->SetSimulatePhysics(true);
+        WeaponBody->SetEnableGravity(true);
+        WeaponBody->SetNotifyRigidBodyCollision(true);
+        WeaponBody->SetUseCCD(true);
+        WeaponBody->OnComponentHit.AddDynamic(this, &UVRPhysicsWeaponComponent::HandleComponentHit);
+    }
+}
+
+void UVRPhysicsWeaponComponent::SetTrackedTarget(const FVRTrackedPose& InTarget)
+{
+    TrackedTarget = InTarget;
+}
+
+void UVRPhysicsWeaponComponent::SetPhysicsDriveEnabled(bool bEnabled)
+{
+    bPhysicsDriveEnabled = bEnabled;
+}
+
+FVector UVRPhysicsWeaponComponent::ComputeLinearDrive(const FTransform& Current, float DeltaTime) const
+{
+    const FVector Error = TrackedTarget.WorldTransform.GetLocation() - Current.GetLocation();
+    const FVector TargetVelocity = TrackedTarget.LinearVelocity;
+    const FVector DesiredAcceleration = (Error * 90.0f - TargetVelocity * -0.0f) / FMath::Max(DeltaTime, KINDA_SMALL_NUMBER);
+    return DesiredAcceleration.GetClampedToMaxSize(LinearDriveForce);
+}
+
+FVector UVRPhysicsWeaponComponent::ComputeAngularDrive(const FTransform& Current, float DeltaTime) const
+{
+    const FQuat DeltaQ = TrackedTarget.WorldTransform.GetRotation() * Current.GetRotation().Inverse();
+    FVector Axis;
+    float Angle;
+    DeltaQ.ToAxisAndAngle(Axis, Angle);
+    if (Angle > PI)
+    {
+        Angle -= 2.0f * PI;
+    }
+    return Axis * (Angle / FMath::Max(DeltaTime, KINDA_SMALL_NUMBER));
+}
+
+void UVRPhysicsWeaponComponent::ResolveTrackingSafety(const FTransform& Current)
+{
+    // Keep physical collision authoritative. If the body falls too far behind the
+    // tracked target, gameplay can display a resistance/haptic event rather than
+    // teleporting through geometry.
+    const float Error = FVector::Distance(Current.GetLocation(), TrackedTarget.WorldTransform.GetLocation());
+    if (Error > MaxTrackingError)
+    {
+        // Hook this into the haptics/router layer. No SetWorldTransform on the
+        // collidable weapon is intentionally performed here.
+    }
+}
+
+void UVRPhysicsWeaponComponent::StepPhysics(float DeltaTime)
+{
+    if (!bPhysicsDriveEnabled || !WeaponBody || !TrackedTarget.bTracked)
+    {
+        return;
+    }
+
+    const FTransform Current = WeaponBody->GetComponentTransform();
+    ResolveTrackingSafety(Current);
+
+    const FVector Force = ComputeLinearDrive(Current, DeltaTime) * WeaponBody->GetMass();
+    WeaponBody->AddForce(Force, NAME_None, true);
+
+    const FVector AngularDrive = ComputeAngularDrive(Current, DeltaTime);
+    WeaponBody->AddTorqueInRadians(AngularDrive * AngularDriveTorque, NAME_None, true);
+}
+
+void UVRPhysicsWeaponComponent::HandleComponentHit(
+    UPrimitiveComponent* HitComponent,
+    AActor* OtherActor,
+    UPrimitiveComponent* OtherComp,
+    FVector NormalImpulse,
+    const FHitResult& Hit)
+{
+    if (!OtherComp)
+    {
+        return;
+    }
+
+    const FVector PointVelocity = WeaponBody ? WeaponBody->GetPhysicsLinearVelocityAtPoint(Hit.ImpactPoint) : FVector::ZeroVector;
+    const FVector OtherVelocity = OtherComp->IsSimulatingPhysics()
+        ? OtherComp->GetPhysicsLinearVelocityAtPoint(Hit.ImpactPoint)
+        : FVector::ZeroVector;
+
+    const FVector Relative = PointVelocity - OtherVelocity;
+    const float NormalSpeed = FMath::Abs(FVector::DotProduct(Relative, Hit.ImpactNormal));
+    const FVector Tangential = Relative - FVector::DotProduct(Relative, Hit.ImpactNormal) * Hit.ImpactNormal;
+
+    FVRWeaponContact Event;
+    Event.OtherComponent = OtherComp;
+    Event.Point = Hit.ImpactPoint;
+    Event.Normal = Hit.ImpactNormal;
+    Event.RelativeVelocity = Relative;
+    Event.NormalSpeed = NormalSpeed;
+    Event.TangentialSpeed = Tangential.Size();
+    Event.Energy = 0.5f * FMath::Max(WeaponBody ? WeaponBody->GetMass() : 1.0f, 0.01f) * FMath::Square(NormalSpeed);
+    Event.Type = (OtherActor && OtherActor->ActorHasTag(TEXT("Weapon")))
+        ? EVRWeaponContactType::Deflect
+        : EVRWeaponContactType::EnvironmentImpact;
+
+    OnWeaponContact.Broadcast(Event);
+}
