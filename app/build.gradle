@@ -5,6 +5,9 @@ plugins {
 android {
     namespace 'com.studio.aegis'
     compileSdk 34
+    
+    // Explicitly set the NDK version for GitHub Actions
+    ndkVersion "26.1.10909125"
 
     defaultConfig {
         applicationId "com.studio.aegis"
